@@ -81,6 +81,10 @@ bool Contains(const std::string& text, const std::string& needle) {
     return text.find(needle) != std::string::npos;
 }
 
+bool StartsWith(const std::string& text, const std::string& prefix) {
+    return text.compare(0, prefix.size(), prefix) == 0;
+}
+
 bool HasInstruction(const DiscoveryResult& result, std::uint32_t address, InstructionSet state) {
     for (const auto& inst : result.instructions) {
         if (inst.address == address && inst.state == state) return true;
@@ -274,10 +278,14 @@ void TestSameAddressBothModes() {
 }
 
 // LDR literal points at +8, and the B at +4 then executes that pool word.
+// B at +4 (0xEAFFFFFF) targets the next address, +8, so the edge is a branch, not a fall-through.
 void TestCodeInLiteralPool() {
     const auto code = Arm({0xE59F0000u, 0xEAFFFFFFu, 0xE12FFF1Eu});
     const auto message = Rejection([&] { Run(code, kArmEntry); });
     Check(Contains(message, "0x00100008"));
+    Check(Contains(message, "first referencing load reached at 0x00100000"));
+    Check(Contains(message, "reached from 0x00100004 by branch"));
+    Check(!Contains(message, "fall-through"));
 }
 
 void TestMisalignedEntry() {
@@ -344,6 +352,50 @@ void TestOverlapInsideT32() {
     Check(Contains(message, "0x00100002"));
 }
 
+// Existing rejection sentences stay at the start of the message; provenance is appended after.
+void TestRejectionPrefixes() {
+    const auto pool_code = Arm({0xE59F0000u, 0xEAFFFFFFu, 0xE12FFF1Eu});
+    const auto pool_message = Rejection([&] { Run(pool_code, kArmEntry); });
+    Check(StartsWith(pool_message, "Decoded instruction overlaps a literal pool at guest address 0x00100008"));
+    const auto mode_code = Arm({0xFA000002u, 0xEA000001u, 0xE1A00000u, 0xE1A00000u, 0xE12FFF1Eu});
+    const auto mode_message = Rejection([&] { Run(mode_code, kArmEntry); });
+    Check(StartsWith(mode_message, "Address is decoded as both ARM and Thumb at guest address 0x00100010"));
+}
+
+// LDR r0,[pc,#4] at +0 reads the word at +0x0C. Flow falls through +4 and +8 into that word.
+void TestPoolFallThroughProvenance() {
+    const auto code = Arm({0xE59F0004u, 0xE1A00000u, 0xE1A00000u, 0xE12FFF1Eu});
+    const auto message = Rejection([&] { Run(code, kArmEntry); });
+    Check(StartsWith(message, "Decoded instruction overlaps a literal pool at guest address 0x0010000C"));
+    Check(Contains(message, "first referencing load reached at 0x00100000"));
+    Check(Contains(message, "reached from 0x00100008 by fall-through"));
+}
+
+// The same load, but B at +4 branches straight into the pool word at +0x0C.
+void TestPoolBranchProvenance() {
+    const auto code = Arm({0xE59F0004u, 0xEA000000u, 0xE1A00000u, 0xE12FFF1Eu});
+    const auto message = Rejection([&] { Run(code, kArmEntry); });
+    Check(StartsWith(message, "Decoded instruction overlaps a literal pool at guest address 0x0010000C"));
+    Check(Contains(message, "first referencing load reached at 0x00100000"));
+    Check(Contains(message, "reached from 0x00100004 by branch"));
+}
+
+// BL at +0 occupies +0..+3; B at +4 targets +2, inside that instruction.
+void TestOverlapProvenance() {
+    const auto code = Thumb({0xF000u, 0xF806u, 0xE7FDu, 0x4770u});
+    const auto message = Rejection([&] { Run(code, kThumbEntry); });
+    Check(StartsWith(message, "Decoded instruction overlaps another decoded instruction at guest address 0x00100002"));
+    Check(Contains(message, "(reached from 0x00100004)"));
+}
+
+// B +0 reaches MOV at +8, which falls through to LDR at +0x0C; that load reads the code word at +8.
+void TestLiteralOverlapsCodeProvenance() {
+    const auto code = Arm({0xEA000000u, 0xE12FFF1Eu, 0xE1A00000u, 0xE51F000Cu});
+    const auto message = Rejection([&] { Run(code, kArmEntry); });
+    Check(StartsWith(message, "Literal pool overlaps decoded code at guest address 0x00100008"));
+    Check(Contains(message, "(literal referenced by the load at 0x0010000C)"));
+}
+
 void TestDeterministic() {
     const auto code = Concat({Arm({0xFA000002u, 0xE12FFF1Eu}), Zeros(8), Thumb({0x2000u, 0x4770u})});
     const auto first = Run(code, kArmEntry);
@@ -380,7 +432,12 @@ int main() {
     TestInfiniteLoop();
     TestArmThumbOverlap();
     TestOverlapInsideT32();
+    TestRejectionPrefixes();
+    TestPoolFallThroughProvenance();
+    TestPoolBranchProvenance();
+    TestOverlapProvenance();
+    TestLiteralOverlapsCodeProvenance();
     TestDeterministic();
-    std::cout << "Code discovery regression checks passed (21 tests).\n";
+    std::cout << "Code discovery regression checks passed (26 tests).\n";
     return 0;
 }

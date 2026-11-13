@@ -194,6 +194,14 @@ Rejected inputs fail with `std::invalid_argument` naming the guest address:
 - execution falling off `.text` (or a truncated T32 instruction), and an entry point
   outside `.text` or misaligned.
 
+Rejection messages keep the sentence and guest address above and add provenance in
+parentheses: the first load reached that referenced the literal-pool word (later loads
+are not recorded), and the instruction that reached the conflicting address, marked as
+fall-through or branch. The provenance is a hint for classifying the address as code or
+data, not a rule: check the flow that reaches it, such as a call that may not return or a
+missing terminator. Provenance is diagnostic only; accepted inputs and flow rules are
+unchanged.
+
 Tests: `translator/tests/code_discovery_tests.cpp`, built by `scripts/run_host_tests.cmd`.
 
 ## Troubleshooting

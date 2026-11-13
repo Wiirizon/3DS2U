@@ -39,14 +39,14 @@ would match blocks translated for an earlier one. This is not covered by any tes
 **Translator.** The translator has no CRO awareness. A grep for `cro` in
 `translator/` finds nothing relevant. Its input is an uncompressed `.code` file plus an
 optional decrypted ExHeader (`translator/include/binary_loader.hpp:26-37`). The entry
-point must be in `.text` (`translator/src/code_discovery.cpp:213`). The output is C++
+point must be in `.text` (`translator/src/code_discovery.cpp:228`). The output is C++
 with `RegisterBlock(address, function)` calls (`translator/src/cpp_emitter.cpp:285-311`).
 
 **Absolute addresses are baked in.** Branch targets are emitted as constants:
 `cpu.r[15] = 0x...` (`translator/src/branch_translator.cpp:39`). Image sections are
 copied from file bytes at their virtual addresses (`cpp_emitter.cpp:127-132`,
 `:267-275`). Literal pools outside `.text` are not recorded
-(`code_discovery.cpp:274-275`). Code translated for one address and bytes is only
+(`code_discovery.cpp:306-307`, `RecordLiteral`). Code translated for one address and bytes is only
 correct for that address and those bytes.
 
 **Existing tests.** `wiiu_runtime/tests/cro_tests.cpp` builds synthetic CRO images in
@@ -163,7 +163,7 @@ available (see Open questions).
 
 - `translator/include/binary_loader.hpp:26-37`: new input path. A CRO plus manifest,
   not only `.code` plus ExHeader. Keep the current path unchanged.
-- Multiple roots. `DiscoverCode` takes one entry (`translator/src/code_discovery.cpp:340-342`)
+- Multiple roots. `DiscoverCode` takes one entry (`translator/src/code_discovery.cpp:379-381`)
   and `ResolveEntryBlock` requires exactly one (`translator/src/cpp_emitter.cpp:46-59`).
   CRO needs one root per exported function. Whether the existing discovery can take a
   list without change was **not verified**.

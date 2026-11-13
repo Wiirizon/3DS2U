@@ -17,11 +17,18 @@ namespace {
 
 constexpr std::uint64_t kAddressSpace = std::uint64_t{1} << 32;
 
-[[noreturn]] void Reject(const std::string& what, std::uint64_t address) {
-    std::ostringstream message;
-    message << what << " at guest address 0x" << std::hex << std::uppercase << std::setfill('0')
-            << std::setw(8) << address;
-    throw std::invalid_argument(message.str());
+std::string HexAddress(std::uint64_t address) {
+    std::ostringstream text;
+    text << "0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(8) << address;
+    return text.str();
+}
+
+// A non-empty detail is appended in parentheses after the guest address.
+[[noreturn]] void Reject(const std::string& what, std::uint64_t address,
+                         const std::string& detail = {}) {
+    std::string message = what + " at guest address " + HexAddress(address);
+    if (!detail.empty()) message += " (" + detail + ")";
+    throw std::invalid_argument(message);
 }
 
 // Successors of one instruction: at most one direct target, plus fall-through.
@@ -201,6 +208,14 @@ std::optional<std::uint32_t> LiteralOf(const Instruction& inst) {
     return inst.state == InstructionSet::Thumb ? ThumbLiteral(inst) : ArmLiteral(inst);
 }
 
+// A location waiting to be visited. `from` is the instruction that reached it (none for the entry);
+// `fall_through` is true only for the sequential successor of `from`, false for branch targets.
+struct Pending {
+    CodeLocation location;
+    std::optional<std::uint32_t> from;
+    bool fall_through{};
+};
+
 // Worklist walker. Each address is decoded at most once, so work is bounded by .text size.
 class Discoverer {
 public:
@@ -211,11 +226,11 @@ public:
 
     [[nodiscard]] DiscoveryResult Run(CodeLocation entry) {
         if (!InText(entry.address)) Reject("Entry point is outside .text", entry.address);
-        Enqueue(entry);
+        Enqueue(entry, std::nullopt, false);
         while (!pending_.empty()) {
-            const auto location = pending_.back();
+            const auto pending = pending_.back();
             pending_.pop_back();
-            Visit(location);
+            Visit(pending);
         }
         return Collect();
     }
@@ -264,22 +279,43 @@ private:
         return false;
     }
 
-    [[nodiscard]] bool PoolOverlaps(std::uint64_t address, std::uint32_t width) const {
+    // The pool word overlapping [address, address + width), if any.
+    [[nodiscard]] std::optional<std::uint32_t> FindPool(std::uint64_t address, std::uint32_t width) const {
         for (std::uint64_t word = address & ~std::uint64_t{3}; word < address + width; word += 4) {
-            if (pools_.contains(static_cast<std::uint32_t>(word))) return true;
+            if (pools_.contains(static_cast<std::uint32_t>(word))) return static_cast<std::uint32_t>(word);
         }
-        return false;
+        return std::nullopt;
+    }
+
+    // "reached from 0x........", or empty when the location has no origin.
+    [[nodiscard]] std::string ReachedFrom(const Pending& pending) const {
+        return pending.from ? "reached from " + HexAddress(*pending.from) : std::string{};
+    }
+
+    // Names the first load that referenced the pool word (later loads are not tracked).
+    [[nodiscard]] std::string PoolDetail(std::uint32_t word, const Pending& pending) const {
+        std::string detail = "literal word; first referencing load reached at " +
+                             HexAddress(pool_source_.at(word));
+        if (pending.from) {
+            detail += "; reached from " + HexAddress(*pending.from) + " by " +
+                      (pending.fall_through ? "fall-through" : "branch");
+        }
+        return detail;
     }
 
     // Literals outside .text are external data and are not recorded.
-    void RecordLiteral(std::uint32_t literal) {
+    void RecordLiteral(std::uint32_t literal, std::uint32_t load) {
         const std::uint32_t word = literal & ~3u;
         if (word < base_ || std::uint64_t{word} + 4 > end_) return;
-        if (CodeOverlaps(word, 4)) Reject("Literal pool overlaps decoded code", word);
+        if (CodeOverlaps(word, 4)) {
+            Reject("Literal pool overlaps decoded code", word,
+                   "literal referenced by the load at " + HexAddress(load));
+        }
         pools_.insert(word);
+        pool_source_.try_emplace(word, load);  // The first load to reference a word is its source.
     }
 
-    void Enqueue(CodeLocation location) {
+    void Enqueue(CodeLocation location, std::optional<std::uint32_t> from, bool fall_through) {
         const std::uint32_t alignment = location.state == InstructionSet::Thumb ? 2u : 4u;
         if (location.address % alignment != 0) Reject("Misaligned branch target", location.address);
         if (!InText(location.address)) return;  // External targets are not followed.
@@ -287,10 +323,11 @@ private:
             (options_.all_thumb || InForcedRange(location.address))) {
             Reject("ARM state where Thumb is forced by --thumb or --thumb-range", location.address);
         }
-        pending_.push_back(location);
+        pending_.push_back(Pending{location, from, fall_through});
     }
 
-    void Visit(CodeLocation location) {
+    void Visit(const Pending& pending) {
+        const auto location = pending.location;
         const auto known = decoded_.find(location.address);
         if (known != decoded_.end()) {
             if (known->second.state != location.state) {
@@ -300,19 +337,20 @@ private:
         }
         const auto inst = Fetch(location);
         if (CodeOverlaps(inst.address, inst.Width())) {
-            Reject("Decoded instruction overlaps another decoded instruction", inst.address);
+            Reject("Decoded instruction overlaps another decoded instruction", inst.address,
+                   ReachedFrom(pending));
         }
-        if (PoolOverlaps(inst.address, inst.Width())) {
-            Reject("Decoded instruction overlaps a literal pool", inst.address);
+        if (const auto word = FindPool(inst.address, inst.Width())) {
+            Reject("Decoded instruction overlaps a literal pool", inst.address, PoolDetail(*word, pending));
         }
         decoded_.emplace(inst.address, inst);
-        if (const auto literal = LiteralOf(inst)) RecordLiteral(*literal);
+        if (const auto literal = LiteralOf(inst)) RecordLiteral(*literal, inst.address);
         const auto flow = FlowOf(inst);
-        if (flow.target) Enqueue(*flow.target);
+        if (flow.target) Enqueue(*flow.target, inst.address, false);
         if (flow.fall_through) {
             const std::uint64_t next = std::uint64_t{inst.address} + inst.Width();
             if (next >= end_) Reject("Execution falls off the end of .text", next);
-            Enqueue(CodeLocation{static_cast<std::uint32_t>(next), inst.state});
+            Enqueue(CodeLocation{static_cast<std::uint32_t>(next), inst.state}, inst.address, true);
         }
     }
 
@@ -332,7 +370,8 @@ private:
     const DiscoveryOptions& options_;
     std::unordered_map<std::uint32_t, Instruction> decoded_;
     std::set<std::uint32_t> pools_;
-    std::vector<CodeLocation> pending_;
+    std::unordered_map<std::uint32_t, std::uint32_t> pool_source_;  // pool word -> first referencing load
+    std::vector<Pending> pending_;
 };
 
 } // namespace
